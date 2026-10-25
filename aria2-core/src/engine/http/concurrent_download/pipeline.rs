@@ -630,7 +630,7 @@ pub async fn execute_with_coordinator(
                         completed_bytes: coordinator.completed_bytes(),
                         flush_checkpoint: true,
                         error_context: "",
-                    in_flight: Some(&mut in_flight_progress),
+                        in_flight: Some(&mut in_flight_progress),
                     },
                     WriteChunk { offset, data },
                 )
