@@ -5,7 +5,7 @@ use crate::engine::concurrent_segment_manager::ConcurrentSegmentManager;
 use crate::error::{Aria2Error, Result};
 use crate::filesystem::control_file::ControlFile;
 use crate::filesystem::disk_writer::{CachedDiskWriter, SeekableDiskWriter};
-use crate::filesystem::resume_helper::ResumeState;
+use crate::filesystem::resume_helper::{ResumeState, is_sequential_checkpoint};
 use crate::rate_limiter::{RateLimiter, RateLimiterConfig};
 use crate::request::request_group::DownloadOptions;
 use crate::util::rwlock_ext::RwLockRecover;
@@ -50,6 +50,7 @@ pub(super) async fn prepare(
         })
         .and_then(ControlFile::piece_length)
         .map(u64::from)
+        .filter(|&piece_size| piece_size > 0 && piece_size < total_length)
         .unwrap_or_else(|| calculate_fixed_piece_size(total_length));
     let piece_length = u32::try_from(fixed_piece_size).map_err(|_| {
         Aria2Error::InvalidArgument(format!(
@@ -176,7 +177,11 @@ pub(super) async fn prepare(
     // sidecar left behind. If replacing that sidecar failed, the file and
     // its progress metadata cannot be reconciled, so restart the segments
     // instead of trusting ResumeState::start_offset.
-    let can_restore_prefix = resume_state.control_file.is_none()
+    let sequential_checkpoint = resume_state
+        .control_file
+        .as_ref()
+        .is_some_and(|control_file| is_sequential_checkpoint(control_file, total_length));
+    let can_restore_prefix = (resume_state.control_file.is_none() || sequential_checkpoint)
         && resume_state.should_resume
         && (!has_untrusted_control_file || can_initialize_new_control_file);
 
@@ -235,6 +240,18 @@ pub(super) async fn prepare(
     } else {
         0
     };
+    // The replacement checkpoint must preserve the segments restored from a
+    // sequential prefix; otherwise its next resume would forget those bytes.
+    if let Some(control_file) = ctrl_file.as_mut() {
+        for (offset, length) in coordinator.completed_ranges() {
+            if offset % fixed_piece_size == 0
+                && length == fixed_piece_size.min(total_length.saturating_sub(offset))
+                && let Ok(index) = usize::try_from(offset / fixed_piece_size)
+            {
+                control_file.mark_piece_done(index);
+            }
+        }
+    }
     dl.progress_updater.reset(restored_bytes);
     dl.progress.set_completed_length(restored_bytes);
 
