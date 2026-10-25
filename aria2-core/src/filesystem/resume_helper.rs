@@ -32,16 +32,28 @@ pub(crate) fn is_sequential_checkpoint(cf: &ControlFile, total_length: u64) -> b
 /// in-flight piece of a split checkpoint.
 fn in_flight_prefix(cf: &ControlFile, index: u64) -> u64 {
     const BLOCK_SIZE: u64 = 16 * 1024;
+    let Some(piece_length) = cf.piece_length().map(u64::from) else {
+        return 0;
+    };
+    let Some(expected_length) = index
+        .checked_mul(piece_length)
+        .and_then(|offset| cf.total_length().checked_sub(offset))
+        .map(|remaining| remaining.min(piece_length))
+    else {
+        return 0;
+    };
+    if expected_length == 0 {
+        return 0;
+    }
+
     cf.in_flight_pieces()
         .iter()
-        .find(|piece| u64::from(piece.index) == index)
+        .find(|piece| u64::from(piece.index) == index && u64::from(piece.length) == expected_length)
         .map(|piece| {
             let blocks = (0..piece.bitfield.len() * 8)
                 .take_while(|block| piece.bitfield[block / 8] & (1 << (7 - block % 8)) != 0)
                 .count() as u64;
-            blocks
-                .saturating_mul(BLOCK_SIZE)
-                .min(u64::from(piece.length))
+            blocks.saturating_mul(BLOCK_SIZE).min(expected_length)
         })
         .unwrap_or(0)
 }
@@ -345,6 +357,42 @@ mod tests {
         control.save().await.unwrap();
         let state = ResumeHelper::new(&out_path, true).detect(0).await.unwrap();
         assert_eq!(state.start_offset, 176 * 1024);
+    }
+
+    #[tokio::test]
+    async fn split_checkpoint_ignores_in_flight_piece_longer_than_file_tail() {
+        use crate::filesystem::control_file::ControlFileInFlightPiece;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("short-tail.bin");
+        let control_path = ControlFile::control_path_for(&out_path);
+        let total_length = 100 * 1024;
+        let piece_length = 64 * 1024;
+
+        tokio::fs::write(&out_path, vec![0xCD; total_length as usize])
+            .await
+            .unwrap();
+        let mut control = ControlFile::open_or_create_with_piece_length(
+            &control_path,
+            total_length,
+            piece_length,
+        )
+        .await
+        .unwrap();
+        control.mark_piece_done(0);
+        control.set_in_flight_pieces(vec![ControlFileInFlightPiece {
+            index: 1,
+            length: piece_length,
+            bitfield: vec![0b1110_0000],
+        }]);
+        control.update_completed_length(80 * 1024);
+        control.save().await.unwrap();
+
+        let state = ResumeHelper::new(&out_path, true).detect(0).await.unwrap();
+
+        assert!(state.should_resume);
+        assert_eq!(state.start_offset, piece_length as u64);
+        assert!(state.start_offset <= total_length);
     }
 
     #[tokio::test]
