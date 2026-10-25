@@ -84,6 +84,10 @@ fn reserve_udp_port() -> u16 {
         .port()
 }
 
+fn status_usize(status: &Value, key: &str) -> Option<usize> {
+    status.get(key)?.as_str()?.parse().ok()
+}
+
 async fn wait_for_seed(client: &RunningAria2, gid: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -93,7 +97,9 @@ async fn wait_for_seed(client: &RunningAria2, gid: &str) {
             "aria2.tellStatus",
             json!([gid, ["status", "completedLength", "totalLength"]]),
         );
-        if status["status"] == "active" && status["completedLength"] == SEED.len().to_string() {
+        if status["status"] == "active"
+            && status_usize(&status, "completedLength") == Some(SEED.len())
+        {
             assert_eq!(status["totalLength"], SEED.len().to_string());
             return;
         }
@@ -375,7 +381,7 @@ async fn cli_rpc_seeder_accepts_inbound_utp_peer_and_uploads_verified_piece() {
             "aria2.tellStatus",
             json!([gid, ["status", "completedLength", "uploadLength"]]),
         );
-        if status["uploadLength"] == SEED.len().to_string() {
+        if status_usize(&status, "uploadLength") == Some(SEED.len()) {
             assert_eq!(status["status"], "active");
             assert_eq!(status["completedLength"], SEED.len().to_string());
             break;

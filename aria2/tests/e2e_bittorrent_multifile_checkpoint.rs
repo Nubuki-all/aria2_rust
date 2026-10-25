@@ -450,7 +450,11 @@ async fn cli_resumes_multifile_checkpoint_and_syncs_touched_files() {
             "aria2.tellStatus",
             json!([gid, ["status", "completedLength", "totalLength"]]),
         );
-        if status["completedLength"] == PIECE_LENGTH.to_string() {
+        if status["completedLength"]
+            .as_str()
+            .and_then(|length| length.parse::<usize>().ok())
+            == Some(PIECE_LENGTH)
+        {
             assert_eq!(status["status"], "active", "piece 1 remains unavailable");
             assert_eq!(status["totalLength"], (PIECE_LENGTH * 2).to_string());
             break;

@@ -374,7 +374,11 @@ async fn cli_resumes_multifile_web_seed_checkpoint_without_refetching_completed_
             "aria2.tellStatus",
             json!([&gid, ["status", "completedLength", "totalLength"]]),
         );
-        if status["completedLength"] == PIECE_LENGTH.to_string() {
+        if status["completedLength"]
+            .as_str()
+            .and_then(|length| length.parse::<usize>().ok())
+            == Some(PIECE_LENGTH)
+        {
             break status;
         }
         assert!(
