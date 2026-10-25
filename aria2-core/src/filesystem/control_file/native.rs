@@ -281,9 +281,8 @@ pub(super) fn parse_native_control_file(path: &Path, data: &[u8]) -> Result<Opti
         ));
     }
 
-    // Validate the in-flight-piece records even though the generic Rust
-    // checkpoint does not currently restore block-level progress.  This
-    // prevents malformed native files from being accepted as resumable state.
+    // Validate in-flight records before accepting checkpoint state. The
+    // multi-mirror HTTP path restores only compatible contiguous block prefixes.
     let in_flight_count = usize::try_from(reader.u32("in-flight piece count")?).map_err(|_| {
         Aria2Error::FileIo("Native control file in-flight count is too large".to_string())
     })?;

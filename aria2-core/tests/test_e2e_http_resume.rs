@@ -47,12 +47,28 @@ async fn wait_for_completed_length_at_least(
     .expect("download did not reach the expected completed length");
 }
 
-fn range_start(entry: &RequestLog) -> Option<u64> {
+async fn wait_for_checkpoint_length_at_least(path: &std::path::Path, expected: u64) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(checkpoint)) = ControlFile::load(path).await
+                && checkpoint.completed_length() >= expected
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("control file did not persist the expected completed length");
+}
+
+fn payload_range_start(entry: &RequestLog) -> Option<u64> {
     entry
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("range"))
         .and_then(|(_, value)| value.strip_prefix("bytes="))
+        .filter(|value| *value != "0-0")
         .and_then(|value| value.split_once('-'))
         .and_then(|(start, _)| start.parse().ok())
 }
@@ -119,6 +135,7 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
         .send(EngineCommand::Pause { gid })
         .expect("initial pause command");
     wait_for_group_status(&group, DownloadStatus::Paused).await;
+    wait_for_checkpoint_length_at_least(&control_path, 2 * 1024 * 1024).await;
 
     let initial_checkpoint = ControlFile::load(&control_path)
         .await
@@ -136,7 +153,8 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
             .send(EngineCommand::Unpause { gid })
             .expect("resume command");
         wait_for_group_status(&group, DownloadStatus::Active).await;
-        wait_for_completed_length_at_least(&group, previous_checkpoint + fixed_piece_size).await;
+        wait_for_checkpoint_length_at_least(&control_path, previous_checkpoint + fixed_piece_size)
+            .await;
         command_tx
             .send(EngineCommand::Pause { gid })
             .expect("pause command");
@@ -160,13 +178,16 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
         let requests = server.take_request_log();
         let earliest_start = requests
             .iter()
-            .filter_map(range_start)
+            .filter_map(payload_range_start)
             .min()
             .expect("resumed HTTP requests should carry Range headers");
         let minimum_allowed_start = previous_checkpoint.saturating_sub(in_flight_allowance);
         assert!(
             earliest_start >= minimum_allowed_start,
-            "resume {resume_index} restarted too far back: earliest Range={earliest_start}, pause checkpoint={previous_checkpoint}, allowance={in_flight_allowance}"
+            "resume {resume_index} restarted too far back: earliest Range={earliest_start}, pause checkpoint={previous_checkpoint}, allowance={in_flight_allowance}, requests={requests:?}, bitfield={:?}, completed_pieces={}, piece_length={:?}",
+            checkpoint.bitfield(),
+            checkpoint.completed_pieces(),
+            checkpoint.piece_length()
         );
         previous_checkpoint = checkpoint.completed_length();
     }

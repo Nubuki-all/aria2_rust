@@ -168,6 +168,7 @@ pub async fn execute(
                 limiter.as_ref(),
                 &mut ctrl_file,
                 completed_bytes,
+                None,
             )
             .await?;
             return Err(e);
@@ -253,8 +254,11 @@ pub async fn execute(
                 &mut writer,
                 limiter.as_ref(),
                 &mut ctrl_file,
-                completed_bytes,
-                "",
+                io::DrainWriteChunksOptions {
+                    completed_bytes,
+                    in_flight: None,
+                    error_context: "",
+                },
             )
             .await?;
             if manager.is_complete() {
@@ -307,11 +311,14 @@ pub async fn execute(
             &mut writer,
             limiter.as_ref(),
             &mut ctrl_file,
-            completed_bytes,
-            "",
+            io::DrainWriteChunksOptions {
+                completed_bytes,
+                in_flight: None,
+                error_context: "",
+            },
         )
         .await?;
-        super::flush_requested_control_file(dl, &mut writer, &mut ctrl_file, completed_bytes)
+        super::flush_requested_control_file(dl, &mut writer, &mut ctrl_file, completed_bytes, None)
             .await?;
 
         // Use tokio::select! to drain writes concurrently while waiting
@@ -367,8 +374,11 @@ pub async fn execute(
                     &mut writer,
                     limiter.as_ref(),
                     &mut ctrl_file,
-                    completed_bytes,
-                    "",
+                    io::DrainWriteChunksOptions {
+                        completed_bytes,
+                        in_flight: None,
+                        error_context: "",
+                    },
                 )
                 .await?;
 
@@ -460,6 +470,7 @@ pub async fn execute(
                             &mut writer,
                             &mut ctrl_file,
                             completed_bytes,
+                            None,
                         )
                         .await?;
                     }
@@ -539,6 +550,7 @@ pub async fn execute(
                                 limiter.as_ref(),
                                 &mut ctrl_file,
                                 completed_bytes,
+                                None,
                             )
                             .await?;
                             return Err(e);
@@ -600,6 +612,7 @@ pub async fn execute(
                                 limiter.as_ref(),
                                 &mut ctrl_file,
                                 completed_bytes,
+                                None,
                             )
                             .await?;
                             return Err(e);
@@ -632,6 +645,7 @@ pub async fn execute(
                         completed_bytes,
                         flush_checkpoint: true,
                         error_context: "",
+                        in_flight: None,
                     },
                     WriteChunk { offset, data },
                 )
@@ -645,6 +659,7 @@ pub async fn execute(
                     &mut writer,
                     &mut ctrl_file,
                     completed_bytes,
+                    None,
                 )
                 .await?;
                 if let Err(e) = dl.check_cancelled() {
@@ -656,6 +671,7 @@ pub async fn execute(
                         limiter.as_ref(),
                         &mut ctrl_file,
                         completed_bytes,
+                        None,
                     )
                     .await?;
                     return Err(e);

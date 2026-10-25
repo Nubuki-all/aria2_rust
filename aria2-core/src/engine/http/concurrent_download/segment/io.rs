@@ -7,7 +7,14 @@ use crate::filesystem::disk_writer::CachedDiskWriter;
 use crate::rate_limiter::RateLimiter;
 
 use super::super::ConcurrentDownloader;
+use super::super::in_flight::InFlightProgress;
 use super::super::range_commit::{HttpRangeCommitOptions, write_http_range_chunk};
+
+pub(super) struct DrainWriteChunksOptions<'a> {
+    pub(super) completed_bytes: u64,
+    pub(super) in_flight: Option<&'a mut InFlightProgress>,
+    pub(super) error_context: &'a str,
+}
 
 pub(super) async fn drain_write_chunks(
     downloader: &ConcurrentDownloader,
@@ -15,8 +22,7 @@ pub(super) async fn drain_write_chunks(
     writer: &mut CachedDiskWriter,
     limiter: Option<&RateLimiter>,
     control_file: &mut Option<ControlFile>,
-    completed_bytes: u64,
-    error_context: &str,
+    mut options: DrainWriteChunksOptions<'_>,
 ) -> Result<()> {
     while let Ok(WriteChunk { offset, data }) = write_rx.try_recv() {
         write_http_range_chunk(
@@ -25,9 +31,10 @@ pub(super) async fn drain_write_chunks(
             limiter,
             control_file,
             HttpRangeCommitOptions {
-                completed_bytes,
+                completed_bytes: options.completed_bytes,
                 flush_checkpoint: false,
-                error_context,
+                error_context: options.error_context,
+                in_flight: options.in_flight.as_deref_mut(),
             },
             WriteChunk { offset, data },
         )

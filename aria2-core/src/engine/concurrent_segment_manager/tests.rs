@@ -153,6 +153,23 @@ fn test_restore_completed_prefix_tracks_partial_parent_offset() {
 }
 
 #[test]
+fn restoring_an_inflight_parent_prefix_resumes_at_its_first_missing_byte() {
+    let mut mgr = ConcurrentSegmentManager::new(
+        300,
+        vec!["http://x.com/f".to_string(), "http://y.com/f".to_string()],
+        Some(100),
+    );
+
+    assert_eq!(mgr.restore_completed_segment_prefix(1, 24), Some(24));
+    assert_eq!(mgr.completed_bytes(), 24);
+    assert_eq!(mgr.segment_status(1), Some(SegmentStatus::Pending));
+    assert_eq!(
+        mgr.next_pending_range_for_segment(1, 1, 50),
+        Some((1, 124, 50))
+    );
+}
+
+#[test]
 fn test_fail_and_reassign() {
     let mut mgr = ConcurrentSegmentManager::new(
         200,

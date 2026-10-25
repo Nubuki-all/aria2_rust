@@ -65,6 +65,7 @@ pub async fn execute_with_coordinator(
         max_conn,
         session_limit,
         mut coordinator,
+        mut in_flight_progress,
         mut writer,
         limiter,
         ctrl_path,
@@ -142,6 +143,7 @@ pub async fn execute_with_coordinator(
                 limiter.as_ref(),
                 &mut ctrl_file,
                 coordinator.completed_bytes(),
+                Some(&mut in_flight_progress),
             )
             .await?;
             return Err(error);
@@ -263,6 +265,7 @@ pub async fn execute_with_coordinator(
                     completed_bytes: coordinator.completed_bytes(),
                     flush_checkpoint: false,
                     error_context: "",
+                    in_flight: Some(&mut in_flight_progress),
                 },
                 chunk,
             )
@@ -273,6 +276,7 @@ pub async fn execute_with_coordinator(
             &mut writer,
             &mut ctrl_file,
             coordinator.completed_bytes(),
+            Some(&in_flight_progress),
         )
         .await?;
 
@@ -352,6 +356,25 @@ pub async fn execute_with_coordinator(
                 let result_authority_key = pool_result.authority_key.clone();
                 match pool_result.result {
                     Ok(bytes_downloaded) => {
+                        // The request result is sent only after its writer chunks
+                        // have entered the channel. Commit them before the
+                        // coordinator can mark this range complete.
+                        while let Ok(WriteChunk { offset, data }) = write_rx.try_recv() {
+                            write_http_range_chunk(
+                                dl,
+                                &mut writer,
+                                limiter.as_ref(),
+                                &mut ctrl_file,
+                                HttpRangeCommitOptions {
+                                    completed_bytes: coordinator.completed_bytes(),
+                                    flush_checkpoint: false,
+                                    error_context: "",
+                                    in_flight: Some(&mut in_flight_progress),
+                                },
+                                WriteChunk { offset, data },
+                            )
+                            .await?;
+                        }
                         let elapsed = seg_start.elapsed();
                         let speed = if elapsed.as_secs_f64() > 0.0 {
                             (bytes_downloaded as f64 / elapsed.as_secs_f64()) as u64
@@ -396,6 +419,9 @@ pub async fn execute_with_coordinator(
                                         ))
                                     })?;
                                 }
+                                let in_flight_pieces =
+                                    in_flight_progress.snapshot(control_file.bitfield());
+                                control_file.set_in_flight_pieces(in_flight_pieces);
                                 control_file.update_completed_length(coordinator.completed_bytes());
                                 if let Err(error) = control_file.save().await {
                                     tracing::warn!(%error, "Failed to save multi-mirror control file");
@@ -491,6 +517,7 @@ pub async fn execute_with_coordinator(
                                 limiter.as_ref(),
                                 &mut ctrl_file,
                                 coordinator.completed_bytes(),
+                                Some(&mut in_flight_progress),
                             )
                             .await?;
                             return Err(e);
@@ -549,6 +576,7 @@ pub async fn execute_with_coordinator(
                                     limiter.as_ref(),
                                     &mut ctrl_file,
                                     coordinator.completed_bytes(),
+                                    Some(&mut in_flight_progress),
                                 )
                                 .await?;
                                 return Err(e);
@@ -588,6 +616,7 @@ pub async fn execute_with_coordinator(
                     &mut writer,
                     &mut ctrl_file,
                     coordinator.completed_bytes(),
+                    Some(&in_flight_progress),
                 )
                 .await?;
             }
@@ -601,6 +630,7 @@ pub async fn execute_with_coordinator(
                         completed_bytes: coordinator.completed_bytes(),
                         flush_checkpoint: true,
                         error_context: "",
+                    in_flight: Some(&mut in_flight_progress),
                     },
                     WriteChunk { offset, data },
                 )
@@ -612,6 +642,7 @@ pub async fn execute_with_coordinator(
                     &mut writer,
                     &mut ctrl_file,
                     coordinator.completed_bytes(),
+                    Some(&in_flight_progress),
                 )
                 .await?;
                 if let Err(error) = dl.check_cancelled() {
@@ -624,6 +655,7 @@ pub async fn execute_with_coordinator(
                         limiter.as_ref(),
                         &mut ctrl_file,
                         coordinator.completed_bytes(),
+                        Some(&mut in_flight_progress),
                     )
                     .await?;
                     return Err(error);
@@ -743,6 +775,7 @@ pub async fn execute_with_coordinator(
         &mut ctrl_file,
         &ctrl_path,
         &progress_tracker,
+        &mut in_flight_progress,
     )
     .await
 }
