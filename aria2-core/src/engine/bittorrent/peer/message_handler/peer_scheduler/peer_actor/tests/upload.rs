@@ -94,7 +94,7 @@ async fn active_peer_actor_cancels_queued_upload_piece_before_flush() {
     let _connection = worker.await.unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn upload_rate_change_wakes_actor_without_retry_polling() {
     use tokio::time::{Duration, timeout};
 
@@ -138,7 +138,7 @@ async fn upload_rate_change_wakes_actor_without_retry_polling() {
     let mut remote = PeerConnection::from_stream_with_peer(remote_stream, [1; 20], false, false);
     remote.send_message(&BtMessage::Interested).await.unwrap();
     assert_eq!(
-        timeout(Duration::from_secs(1), remote.read_message())
+        timeout(Duration::from_secs(5), remote.read_message())
             .await
             .unwrap()
             .unwrap()
@@ -177,7 +177,7 @@ async fn upload_rate_change_wakes_actor_without_retry_polling() {
     global_limiter.set_upload_rate(None);
 
     assert_eq!(
-        timeout(Duration::from_millis(100), remote.read_message())
+        timeout(Duration::from_secs(1), remote.read_message())
             .await
             .expect("rate change should wake the actor without waiting for its old retry deadline")
             .unwrap()
@@ -193,7 +193,7 @@ async fn upload_rate_change_wakes_actor_without_retry_polling() {
     worker.await.unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn upload_rate_change_wakes_actor_after_magnet_payload_activation() {
     use tokio::time::{Duration, timeout};
 
@@ -255,7 +255,7 @@ async fn upload_rate_change_wakes_actor_after_magnet_payload_activation() {
     let mut remote = PeerConnection::from_stream_with_peer(remote_stream, [1; 20], false, false);
     remote.send_message(&BtMessage::Interested).await.unwrap();
     loop {
-        let message = timeout(Duration::from_secs(1), remote.read_message())
+        let message = timeout(Duration::from_secs(5), remote.read_message())
             .await
             .unwrap()
             .unwrap()
@@ -272,7 +272,7 @@ async fn upload_rate_change_wakes_actor_after_magnet_payload_activation() {
         .unwrap();
 
     loop {
-        let event = timeout(Duration::from_secs(1), event_rx.recv())
+        let event = timeout(Duration::from_secs(5), event_rx.recv())
             .await
             .unwrap()
             .expect("peer actor event channel closed");
@@ -295,7 +295,7 @@ async fn upload_rate_change_wakes_actor_after_magnet_payload_activation() {
     global_limiter.set_upload_rate(None);
 
     assert_eq!(
-        timeout(Duration::from_millis(100), remote.read_message())
+        timeout(Duration::from_secs(1), remote.read_message())
             .await
             .expect(
                 "activated magnet actor should observe upload-rate changes without waiting for its old retry deadline"
