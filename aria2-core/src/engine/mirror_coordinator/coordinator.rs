@@ -279,6 +279,16 @@ impl MirrorCoordinator {
         self.segment_manager.restore_completed_prefix(length)
     }
 
+    /// Restore a durable contiguous prefix within one parent segment.
+    pub(crate) fn restore_completed_segment_prefix(
+        &mut self,
+        index: u32,
+        length: u64,
+    ) -> Option<u64> {
+        self.segment_manager
+            .restore_completed_segment_prefix(index, length)
+    }
+
     /// Get the maximum download speed across all mirrors.
     ///
     /// This is used as a baseline for calculating optimal connections.

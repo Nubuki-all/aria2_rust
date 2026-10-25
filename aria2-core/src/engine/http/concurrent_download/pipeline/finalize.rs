@@ -8,6 +8,7 @@ use crate::filesystem::disk_writer::{CachedDiskWriter, SeekableDiskWriter};
 use crate::rate_limiter::RateLimiter;
 use crate::util::rwlock_ext::RwLockRecover;
 
+use super::super::in_flight::InFlightProgress;
 use super::super::{ConcurrentDownloadResult, ConcurrentDownloader};
 use crate::engine::mirror_coordinator::MirrorCoordinator;
 
@@ -23,6 +24,7 @@ pub(super) async fn finish(
     ctrl_file: &mut Option<ControlFile>,
     ctrl_path: &Path,
     progress_tracker: &SegmentProgressTracker,
+    in_flight_progress: &mut InFlightProgress,
 ) -> Result<ConcurrentDownloadResult> {
     if should_fallback {
         super::super::segment::cancel_and_persist(
@@ -33,6 +35,7 @@ pub(super) async fn finish(
             limiter,
             ctrl_file,
             coordinator.completed_bytes(),
+            Some(in_flight_progress),
         )
         .await?;
     } else {
@@ -48,6 +51,7 @@ pub(super) async fn finish(
                 completed_bytes: coordinator.completed_bytes(),
                 flush_checkpoint: false,
                 error_context: "",
+                in_flight: Some(in_flight_progress),
             },
             WriteChunk { offset, data },
         )
@@ -103,6 +107,8 @@ pub(super) async fn finish(
         "HTTP multi-mirror progress aggregation summary"
     );
     if let Some(control_file) = ctrl_file.as_mut() {
+        let in_flight_pieces = in_flight_progress.snapshot(control_file.bitfield());
+        control_file.set_in_flight_pieces(in_flight_pieces);
         control_file.update_completed_length(coordinator.completed_bytes());
         if let Err(error) = control_file.save().await {
             tracing::warn!(%error, "Failed to save final multi-mirror control file");

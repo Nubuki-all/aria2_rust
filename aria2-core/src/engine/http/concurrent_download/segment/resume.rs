@@ -150,7 +150,7 @@ pub(super) async fn prepare(
         }
     }
     let ctrl_save_interval = total_length / num_pieces as u64;
-    flush_requested_control_file(dl, writer, &mut ctrl_file, completed_bytes).await?;
+    flush_requested_control_file(dl, writer, &mut ctrl_file, completed_bytes, None).await?;
 
     Ok(PreparedResume {
         ctrl_path,

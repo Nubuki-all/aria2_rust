@@ -12,7 +12,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::util::rwlock_ext::RwLockRecover;
 
 use super::super::{ConcurrentDownloadResult, ConcurrentDownloader};
-use super::io::drain_write_chunks;
+use super::io::{DrainWriteChunksOptions, drain_write_chunks};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish(
@@ -39,8 +39,11 @@ pub(super) async fn finish(
         writer,
         limiter,
         ctrl_file,
-        completed_bytes,
-        "",
+        DrainWriteChunksOptions {
+            completed_bytes,
+            in_flight: None,
+            error_context: "",
+        },
     )
     .await?;
     writer.sync_all().await.map_err(|error| {

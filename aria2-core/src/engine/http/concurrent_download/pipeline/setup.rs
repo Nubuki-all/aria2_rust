@@ -12,6 +12,7 @@ use crate::util::rwlock_ext::RwLockRecover;
 
 use super::super::ConcurrentDownloader;
 use super::super::fixed_piece_size::calculate_fixed_piece_size;
+use super::super::in_flight::InFlightProgress;
 use super::super::{effective_segment_count, flush_requested_control_file};
 use crate::engine::mirror_coordinator::MirrorCoordinator;
 
@@ -23,6 +24,7 @@ pub(super) struct PreparedMultiMirrorDownload {
     pub(super) max_conn: usize,
     pub(super) session_limit: usize,
     pub(super) coordinator: MirrorCoordinator,
+    pub(super) in_flight_progress: InFlightProgress,
     pub(super) writer: CachedDiskWriter,
     pub(super) limiter: Option<RateLimiter>,
     pub(super) ctrl_path: PathBuf,
@@ -121,6 +123,8 @@ pub(super) async fn prepare(
     }
 
     let num_pieces = coordinator.num_segments().max(1);
+    let mut in_flight_progress =
+        InFlightProgress::new(total_length, fixed_piece_size, coordinator.num_segments());
     tracing::info!(
         split_budget = split,
         requested_split,
@@ -133,16 +137,6 @@ pub(super) async fn prepare(
     let ctrl_path = ControlFile::control_path_for(&dl.output_path);
     dl.group.recover().set_control_file_path(ctrl_path.clone());
     let expected_bitfield_len = num_pieces.div_ceil(8);
-    let persisted_prefix = resume_state
-        .control_file
-        .as_ref()
-        .map(ControlFile::completed_length)
-        .filter(|&length| length > 0)
-        .or_else(|| {
-            (resume_state.control_file.is_none() && resume_state.should_resume)
-                .then_some(resume_state.start_offset)
-        })
-        .unwrap_or(0);
     let compatible_control_file = resume_state.control_file.as_ref().filter(|control_file| {
         control_file.total_length() == total_length
             && !control_file.is_torrent_checkpoint()
@@ -212,10 +206,16 @@ pub(super) async fn prepare(
     };
 
     let restored_bytes = if let Some(control_file) = ctrl_file.as_ref() {
-        let restored = if compatible_control_file.is_some() && control_file.completed_pieces() > 0 {
-            coordinator.restore_completed_from_bitfield(control_file.bitfield())
-        } else if compatible_control_file.is_some() || can_restore_prefix {
-            coordinator.restore_completed_prefix(persisted_prefix)
+        let restored = if compatible_control_file.is_some() {
+            coordinator.restore_completed_from_bitfield(control_file.bitfield());
+            for (index, prefix) in
+                in_flight_progress.restore(control_file.in_flight_pieces(), control_file.bitfield())
+            {
+                coordinator.restore_completed_segment_prefix(index, prefix);
+            }
+            coordinator.completed_bytes()
+        } else if can_restore_prefix {
+            coordinator.restore_completed_prefix(resume_state.start_offset)
         } else {
             0
         };
@@ -240,8 +240,8 @@ pub(super) async fn prepare(
     } else {
         0
     };
-    // The replacement checkpoint must preserve the segments restored from a
-    // sequential prefix; otherwise its next resume would forget those bytes.
+    // Preserve restored full pieces and canonicalize in-flight records. The
+    // completed-length field is an aggregate for this layout, not a prefix.
     if let Some(control_file) = ctrl_file.as_mut() {
         for (offset, length) in coordinator.completed_ranges() {
             if offset % fixed_piece_size == 0
@@ -251,6 +251,8 @@ pub(super) async fn prepare(
                 control_file.mark_piece_done(index);
             }
         }
+        let in_flight_pieces = in_flight_progress.snapshot(control_file.bitfield());
+        control_file.set_in_flight_pieces(in_flight_pieces);
     }
     dl.progress_updater.reset(restored_bytes);
     dl.progress.set_completed_length(restored_bytes);
@@ -285,6 +287,7 @@ pub(super) async fn prepare(
         &mut writer,
         &mut ctrl_file,
         coordinator.completed_bytes(),
+        Some(&in_flight_progress),
     )
     .await?;
     let ctrl_save_interval = (total_length / num_pieces as u64).max(1);
@@ -297,6 +300,7 @@ pub(super) async fn prepare(
         max_conn,
         session_limit,
         coordinator,
+        in_flight_progress,
         writer,
         limiter,
         ctrl_path,

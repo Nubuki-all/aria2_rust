@@ -154,7 +154,10 @@ retry admission.
    submits generic leases through `WorkScheduler`; `request_executor` runs
    `HttpSegmentDownloader` requests and sends offset-bearing response chunks
    to the HTTP output adapter. A range lease is completed only after `sync_all`
-   succeeds; requested checkpoint saves use the same payload barrier.
+   succeeds; requested checkpoint saves use the same payload barrier. For
+   multi-mirror resume, compatible in-flight records restore only each
+   parent's leading contiguous run of durable 16 KiB blocks; gaps and
+   incompatible records are fetched again.
 6. Otherwise, or after concurrent fallback, `SequentialDownloader` streams the
    response after HTTP status and body checks. These checks are protocol
    validation, not cryptographic integrity validation. The output sink writes

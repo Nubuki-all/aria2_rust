@@ -407,6 +407,8 @@ impl MockHttpServer {
                         .header("Content-Range", format!("bytes=*/{}", body.len()))
                         .body(empty_body())
                         .unwrap();
+                } else {
+                    (0, body.len() - 1)
                 };
 
                 let is_range_request = req.headers().contains_key("Range");

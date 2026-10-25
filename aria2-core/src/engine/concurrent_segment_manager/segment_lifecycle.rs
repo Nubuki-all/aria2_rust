@@ -71,6 +71,41 @@ impl ConcurrentSegmentManager {
         self.completed_bytes
     }
 
+    /// Restore a durable contiguous prefix within one parent segment.
+    pub(crate) fn restore_completed_segment_prefix(
+        &mut self,
+        index: u32,
+        length: u64,
+    ) -> Option<u64> {
+        let segment_index = index as usize;
+        let segment_length = self.segments.get(segment_index)?.length;
+        let completed = self.completed_lengths.get_mut(segment_index)?;
+        let restored = length.min(segment_length);
+        if restored <= *completed {
+            return Some(*completed);
+        }
+
+        let previous = *completed;
+        *completed = restored;
+        self.completed_bytes = self
+            .completed_bytes
+            .saturating_add(restored.saturating_sub(previous));
+
+        let segment = self.segments.get_mut(segment_index)?;
+        if let Some(mirror_idx) = segment.assigned_mirror.take()
+            && let Some(mirror) = self.mirrors.get_mut(mirror_idx)
+        {
+            mirror.active_segments = mirror.active_segments.saturating_sub(1);
+        }
+        segment.status = if restored == segment_length {
+            segment.retry_count = 0;
+            SegmentStatus::Done
+        } else {
+            SegmentStatus::Pending
+        };
+        Some(restored)
+    }
+
     /// Return a capacity-limited segment to the pending queue without
     /// consuming its ordinary retry budget.
     pub fn requeue_segment(&mut self, index: u32) -> bool {
