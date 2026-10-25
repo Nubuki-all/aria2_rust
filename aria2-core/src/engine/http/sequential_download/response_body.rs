@@ -238,11 +238,19 @@ impl SequentialDownloader {
                 return Err(e);
             }
 
-            let data: bytes::Bytes = chunk.map_err(|e| {
-                Aria2Error::Recoverable(RecoverableError::TemporaryNetworkFailure {
-                    message: e.to_string(),
-                })
-            })?;
+            let data: bytes::Bytes = match chunk {
+                Ok(data) => data,
+                Err(error) => {
+                    // Like a pause, a broken stream keeps everything written
+                    // so far rather than the last periodic checkpoint.
+                    finalize_cancelled_download(&mut writer, &mut ctrl_file, completed_bytes).await;
+                    return Err(Aria2Error::Recoverable(
+                        RecoverableError::TemporaryNetworkFailure {
+                            message: error.to_string(),
+                        },
+                    ));
+                }
+            };
             if !data.is_empty() {
                 self.progress.record_network_activity();
             }

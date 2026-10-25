@@ -21,6 +21,7 @@ use crate::filesystem::disk_writer::SeekableDiskWriter;
 use crate::filesystem::resume_helper::ResumeState;
 use crate::util::rwlock_ext::RwLockRecover;
 
+use super::in_flight::InFlightProgress;
 use super::range_size_limit::lower_rejected_range_size_limit;
 use super::slow_range::SlowRangeRecovery;
 use super::{ConcurrentDownloadResult, ConcurrentDownloader};
@@ -89,6 +90,12 @@ pub async fn execute(
 
     let cookie_hdr = dl.cookie_helper.build_cookie_header(uri);
 
+    let mut in_flight_progress = InFlightProgress::new(
+        total_length,
+        u64::from(piece_length),
+        manager.num_segments(),
+    );
+
     let output = output::prepare(dl, &options, total_length);
     let mut writer = output.writer;
     let limiter = output.limiter;
@@ -105,6 +112,7 @@ pub async fn execute(
         total_length,
         piece_length,
         &mut writer,
+        &mut in_flight_progress,
     )
     .await?;
     let initial_completed = completed_bytes;
@@ -168,7 +176,7 @@ pub async fn execute(
                 limiter.as_ref(),
                 &mut ctrl_file,
                 completed_bytes,
-                None,
+                Some(&mut in_flight_progress),
             )
             .await?;
             return Err(e);
@@ -256,7 +264,7 @@ pub async fn execute(
                 &mut ctrl_file,
                 io::DrainWriteChunksOptions {
                     completed_bytes,
-                    in_flight: None,
+                    in_flight: Some(&mut in_flight_progress),
                     error_context: "",
                 },
             )
@@ -271,6 +279,17 @@ pub async fn execute(
             }
             if manager.has_failed_segments() && !manager.has_pending_segments() {
                 work_queue.cancel();
+                cancel_and_persist(
+                    dl,
+                    executor,
+                    &mut write_rx,
+                    &mut writer,
+                    limiter.as_ref(),
+                    &mut ctrl_file,
+                    completed_bytes,
+                    Some(&mut in_flight_progress),
+                )
+                .await?;
                 return Err(Aria2Error::Recoverable(
                     RecoverableError::TemporaryNetworkFailure {
                         message: "Concurrent download: all segments failed".into(),
@@ -313,13 +332,19 @@ pub async fn execute(
             &mut ctrl_file,
             io::DrainWriteChunksOptions {
                 completed_bytes,
-                in_flight: None,
+                in_flight: Some(&mut in_flight_progress),
                 error_context: "",
             },
         )
         .await?;
-        super::flush_requested_control_file(dl, &mut writer, &mut ctrl_file, completed_bytes, None)
-            .await?;
+        super::flush_requested_control_file(
+            dl,
+            &mut writer,
+            &mut ctrl_file,
+            completed_bytes,
+            Some(&in_flight_progress),
+        )
+        .await?;
 
         // Use tokio::select! to drain writes concurrently while waiting
         // for segment completions — prevents chunks from piling up in the
@@ -376,7 +401,7 @@ pub async fn execute(
                     &mut ctrl_file,
                     io::DrainWriteChunksOptions {
                         completed_bytes,
-                        in_flight: None,
+                        in_flight: Some(&mut in_flight_progress),
                         error_context: "",
                     },
                 )
@@ -437,6 +462,7 @@ pub async fn execute(
                                         ))
                                     })?;
                                 }
+                                cf.set_in_flight_pieces(in_flight_progress.snapshot(cf.bitfield()));
                                 cf.update_completed_length(completed_bytes);
                                 if let Err(e) = cf.save().await {
                                     tracing::warn!("Control file save failed: {}", e);
@@ -470,7 +496,7 @@ pub async fn execute(
                             &mut writer,
                             &mut ctrl_file,
                             completed_bytes,
-                            None,
+                            Some(&in_flight_progress),
                         )
                         .await?;
                     }
@@ -550,7 +576,7 @@ pub async fn execute(
                                 limiter.as_ref(),
                                 &mut ctrl_file,
                                 completed_bytes,
-                                None,
+                                Some(&mut in_flight_progress),
                             )
                             .await?;
                             return Err(e);
@@ -612,7 +638,7 @@ pub async fn execute(
                                 limiter.as_ref(),
                                 &mut ctrl_file,
                                 completed_bytes,
-                                None,
+                                Some(&mut in_flight_progress),
                             )
                             .await?;
                             return Err(e);
@@ -645,7 +671,7 @@ pub async fn execute(
                         completed_bytes,
                         flush_checkpoint: true,
                         error_context: "",
-                        in_flight: None,
+                        in_flight: Some(&mut in_flight_progress),
                     },
                     WriteChunk { offset, data },
                 )
@@ -659,7 +685,7 @@ pub async fn execute(
                     &mut writer,
                     &mut ctrl_file,
                     completed_bytes,
-                    None,
+                    Some(&in_flight_progress),
                 )
                 .await?;
                 if let Err(e) = dl.check_cancelled() {
@@ -671,7 +697,7 @@ pub async fn execute(
                         limiter.as_ref(),
                         &mut ctrl_file,
                         completed_bytes,
-                        None,
+                        Some(&mut in_flight_progress),
                     )
                     .await?;
                     return Err(e);
@@ -784,6 +810,7 @@ pub async fn execute(
         &ctrl_path,
         completed_bytes,
         &progress_tracker,
+        &mut in_flight_progress,
     )
     .await
 }
