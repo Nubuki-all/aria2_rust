@@ -16,13 +16,13 @@ async fn receive(peer: &UdpSocket) -> UtpPacket {
 }
 
 async fn readable(socket: &UtpSocket) {
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        socket.readiness_socket().unwrap().readable(),
-    )
-    .await
-    .expect("UDP readiness deadline")
-    .unwrap();
+    let readiness = socket.readiness_socket().unwrap();
+    let mut probe = [0; u16::MAX as usize];
+    // Peeking confirms a packet is still queued after cloned-socket readiness.
+    tokio::time::timeout(Duration::from_secs(2), readiness.peek_from(&mut probe))
+        .await
+        .expect("UDP readiness deadline")
+        .unwrap();
 }
 
 #[test]
