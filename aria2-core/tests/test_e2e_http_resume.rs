@@ -18,8 +18,9 @@ fn generate_test_data(size: usize) -> Vec<u8> {
 async fn wait_for_group_status(
     group: &Arc<std::sync::RwLock<RequestGroup>>,
     expected: DownloadStatus,
+    phase: &str,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if group.read().unwrap().status() == expected {
                 return;
@@ -28,7 +29,52 @@ async fn wait_for_group_status(
         }
     })
     .await
-    .expect("download did not reach the expected lifecycle state");
+    .is_ok();
+
+    if !reached {
+        let group = group.read().unwrap();
+        panic!(
+            "download did not reach expected lifecycle state during {phase}: expected={expected:?}, observed={:?}, completed_length={}",
+            group.status(),
+            group.get_completed_length(),
+        );
+    }
+}
+
+async fn wait_for_paused_group_requeue(
+    group: &Arc<std::sync::RwLock<RequestGroup>>,
+    group_man: &RequestGroupMan,
+    phase: &str,
+) {
+    let requeued = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (status, num_commands) = {
+                let group = group.read().unwrap();
+                (group.status(), group.num_commands())
+            };
+            if status == DownloadStatus::Paused
+                && num_commands == 0
+                && group_man.active_count() == 0
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    if !requeued {
+        let (status, num_commands) = {
+            let group = group.read().unwrap();
+            (group.status(), group.num_commands())
+        };
+        let active_groups = group_man.active_count();
+        panic!(
+            "paused download was not fully requeued during {phase}: observed={:?}, num_commands={}, active_groups={}",
+            status, num_commands, active_groups,
+        );
+    }
 }
 
 async fn wait_for_completed_length_at_least(
@@ -120,7 +166,8 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
         )]));
 
     let mut engine = DownloadEngine::new();
-    engine.set_request_group_man(Arc::new(RequestGroupMan::new()));
+    let group_man = Arc::new(RequestGroupMan::new());
+    engine.set_request_group_man(Arc::clone(&group_man));
     let command_tx = engine.engine_command_sender();
     command_tx
         .send(EngineCommand::AddDownload {
@@ -129,12 +176,12 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
         .expect("add download command");
     let engine_task = tokio::spawn(engine.run());
 
-    wait_for_group_status(&group, DownloadStatus::Active).await;
+    wait_for_group_status(&group, DownloadStatus::Active, "initial activation").await;
     wait_for_completed_length_at_least(&group, 2 * 1024 * 1024).await;
     command_tx
         .send(EngineCommand::Pause { gid })
         .expect("initial pause command");
-    wait_for_group_status(&group, DownloadStatus::Paused).await;
+    wait_for_paused_group_requeue(&group, &group_man, "initial pause").await;
     wait_for_checkpoint_length_at_least(&control_path, 2 * 1024 * 1024).await;
 
     let initial_checkpoint = ControlFile::load(&control_path)
@@ -152,13 +199,15 @@ async fn named_http_download_advances_checkpoint_across_repeated_pauses() {
         command_tx
             .send(EngineCommand::Unpause { gid })
             .expect("resume command");
-        wait_for_group_status(&group, DownloadStatus::Active).await;
+        let resume_phase = format!("resume {resume_index} activation");
+        wait_for_group_status(&group, DownloadStatus::Active, &resume_phase).await;
         wait_for_checkpoint_length_at_least(&control_path, previous_checkpoint + fixed_piece_size)
             .await;
         command_tx
             .send(EngineCommand::Pause { gid })
             .expect("pause command");
-        wait_for_group_status(&group, DownloadStatus::Paused).await;
+        let pause_phase = format!("resume {resume_index} pause");
+        wait_for_paused_group_requeue(&group, &group_man, &pause_phase).await;
 
         let checkpoint = ControlFile::load(&control_path)
             .await

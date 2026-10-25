@@ -1775,6 +1775,8 @@ mod stability_tests {
     /// Note: CI environments have inherent variability, so we use a relaxed threshold
     #[test]
     fn test_stability_verification() {
+        const OPERATIONS_PER_SAMPLE: usize = 10;
+
         let config = PerfTestConfig {
             warmup_iterations: 10,
             measured_iterations: 100,
@@ -1789,16 +1791,16 @@ mod stability_tests {
 
         // Test a more substantial operation that takes longer (more stable measurements)
         let result = measure_repeated("stability_test", &config, || {
-            // Use a more complex operation that takes longer to execute
-            // This reduces the relative impact of measurement noise
-            let mut v = Vec::with_capacity(500000);
-            for i in 0..500000 {
-                v.push((i * 7) % 1000);
+            // Batch operations so scheduler noise has less influence on each
+            // sample while keeping the stability threshold unchanged.
+            for _ in 0..OPERATIONS_PER_SAMPLE {
+                let mut v = Vec::with_capacity(500000);
+                for i in 0..500000 {
+                    v.push((i * 7) % 1000);
+                }
+                let sum: i64 = v.iter().map(|&x| x as i64 * x as i64).sum();
+                std::hint::black_box(sum);
             }
-            // Do some actual computation
-            let sum: i64 = v.iter().map(|&x| x as i64 * x as i64).sum();
-            // Prevent optimization
-            std::hint::black_box(sum);
         });
 
         result.print_summary();

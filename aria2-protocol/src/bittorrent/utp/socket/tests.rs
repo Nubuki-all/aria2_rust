@@ -6,11 +6,27 @@ fn test_addr() -> SocketAddr {
 }
 
 async fn poll_recv_after_readable(socket: &mut UtpSocket, readiness: &tokio::net::UdpSocket) {
-    tokio::time::timeout(Duration::from_secs(2), readiness.readable())
-        .await
-        .expect("peer packet should make the uTP socket readable")
-        .unwrap();
-    socket.poll_recv().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut probe = [0; MAX_UDP_RECV_BUFFER];
+        loop {
+            readiness.readable().await.unwrap();
+            match readiness.try_io(tokio::io::Interest::READABLE, || {
+                socket.socket.peek_from(&mut probe)
+            }) {
+                Ok(_) => {
+                    socket.poll_recv().unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // The socket clone may still report readiness after the
+                    // protocol socket consumed the previous datagram.
+                }
+                Err(error) => panic!("failed to inspect queued UDP packet: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("peer packet should make the uTP socket readable");
 }
 
 #[test]
