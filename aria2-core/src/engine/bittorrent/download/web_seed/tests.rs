@@ -10,7 +10,21 @@ async fn web_seed_hostname_uses_a_compatible_policy_source() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    let listener = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+    // `localhost` resolves to `::1`, `127.0.0.1` or both, in an order that
+    // depends on the machine's hosts file and resolver. The policy picks the
+    // source for the first resolved address it has a source family for, so
+    // the fixture listens there and that source is the expected one.
+    let resolved = tokio::net::lookup_host(("localhost", 0))
+        .await
+        .expect("localhost should resolve")
+        .next()
+        .expect("localhost should have an address")
+        .ip();
+    let expected_source = match resolved {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    };
+    let listener = TcpListener::bind((resolved, 0))
         .await
         .expect("web-seed fixture should bind");
     let address = listener.local_addr().expect("web-seed fixture address");
@@ -41,7 +55,8 @@ async fn web_seed_hostname_uses_a_compatible_policy_source() {
     let local_address = policy
         .source_for_host("localhost", address.port())
         .await
-        .expect("web-seed policy should select the IPv4 source for localhost");
+        .expect("web-seed policy should select a source for localhost");
+    assert_eq!(local_address, Some(expected_source));
     let timeout = std::time::Duration::from_secs(60);
     let http_client = super::client::build_client(&tls, local_address, timeout)
         .expect("web-seed HTTP client should build");
@@ -55,7 +70,7 @@ async fn web_seed_hostname_uses_a_compatible_policy_source() {
     assert_eq!(client.download_piece(0, 2, 0, 2).await.unwrap(), b"ok");
     assert_eq!(
         server.await.expect("web-seed fixture should finish").ip(),
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        expected_source
     );
 }
 
