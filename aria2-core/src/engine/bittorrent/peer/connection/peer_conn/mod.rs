@@ -10,7 +10,6 @@
 //! - [`messages`] — protocol message senders, message reading, write helpers
 
 mod connect;
-pub use connect::UtpConnectionOptions;
 mod keepalive;
 mod messages;
 mod session;
@@ -75,8 +74,8 @@ impl PeerActorId {
 /// is separated from the download command logic (see BtRuntime in original).
 ///
 /// Composes:
-/// - An [`InnerConnection`] for actual I/O.
-/// - A [`SendBuffer`] for batching outbound messages.
+/// - An `InnerConnection` for actual I/O.
+/// - A `SendBuffer` for batching outbound messages.
 /// - An optional [`PeerSessionResource`] for per-session state.
 /// - Keep-alive / timeout tracking.
 /// - [`PeerStats`] for integration with the choking algorithm.

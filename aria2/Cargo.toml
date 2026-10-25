@@ -1,6 +1,6 @@
 [package]
 name = "aria2"
-version = "0.3.10"
+version = "0.3.11"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -55,6 +55,9 @@ mimalloc = { version = "0.1", optional = true }
 # Unix-specific dependencies for daemon mode
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 futures.workspace = true

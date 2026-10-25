@@ -459,6 +459,11 @@ async fn udp_receive_wait_is_cut_short_by_the_retry_deadline() {
         .expect("bind silent loopback UDP tracker");
     let mut client = new_direct_client(0).await.unwrap();
     assert!(client.send_connect(tracker.local_addr().unwrap()).await);
+    let dispatched_at = client.inflight[0]
+        .dispatched_at
+        .expect("connect request should have a dispatch time");
+    let expected_wait = Duration::from_secs(5)
+        .saturating_sub(std::time::Instant::now().saturating_duration_since(dispatched_at));
     let started = tokio::time::Instant::now();
 
     assert!(
@@ -466,10 +471,12 @@ async fn udp_receive_wait_is_cut_short_by_the_retry_deadline() {
             .receive_next_with_timeout(Duration::from_secs(60))
             .await
     );
-    assert_eq!(
-        tokio::time::Instant::now() - started,
-        Duration::from_secs(5),
-        "a 60-second tracker timeout must not postpone the first UDP retry"
+    let elapsed = tokio::time::Instant::now() - started;
+    let tolerance = Duration::from_millis(10);
+    assert!(
+        elapsed >= expected_wait.saturating_sub(tolerance)
+            && elapsed <= expected_wait.saturating_add(tolerance),
+        "a 60-second tracker timeout must not postpone the first UDP retry: expected about {expected_wait:?}, waited {elapsed:?}"
     );
 }
 

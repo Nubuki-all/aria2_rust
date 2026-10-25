@@ -93,8 +93,8 @@ pub enum DownloadEvent {
     /// Fired when a download is stopped (not complete, not error).
     /// C++: `PREF_ON_DOWNLOAD_STOP`
     Stop,
-    /// Fired when a BitTorrent download finishes completely
-    /// (all files downloaded and seeding complete).
+    /// Fired when a BitTorrent payload download completes. Seeding may
+    /// continue after this event.
     /// C++: `PREF_ON_BT_DOWNLOAD_COMPLETE`
     BtComplete,
 }
@@ -220,11 +220,11 @@ impl DownloadEvent {
     /// Whether this event can legitimately fire at most **once** for a given
     /// download.
     ///
-    /// `Complete`, `Error` and `BtComplete` are terminal one-shot transitions:
-    /// a download completes once, fails once, and finishes its BT payload
-    /// once. They are emitted from more than one place (the group state
-    /// transition itself *and* the engine-loop demotion path), so observer
-    /// notification is de-duplicated on `(gid, event)` for these variants.
+    /// `Complete`, `Error` and `BtComplete` are one-shot transitions: a
+    /// download completes once, fails once, and finishes its BT payload once.
+    /// They are emitted from more than one place (the group state transition
+    /// itself *and* the engine-loop demotion path), so observer notification is
+    /// de-duplicated on `(gid, event)` for these variants.
     ///
     /// `Start` and `Pause` may repeat across pause/unpause cycles and `Stop`
     /// is re-emitted by the RPC layer on explicit removal, so those are never
@@ -234,16 +234,14 @@ impl DownloadEvent {
     }
 
     /// Whether this notification marks the task as stopped for lifecycle
-    /// observers.
+    /// observers. `BtComplete` only marks payload completion; seeding may
+    /// continue until a later terminal event.
     ///
     /// `Stop` is terminal for the current task run even though aria2 may emit
     /// it again when a caller explicitly removes the task. It is therefore
     /// terminal for waiters but not a one-shot event for de-duplication.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Stop | Self::Complete | Self::Error | Self::BtComplete
-        )
+        matches!(self, Self::Stop | Self::Complete | Self::Error)
     }
 }
 
@@ -270,6 +268,15 @@ impl DownloadEvent {
 pub trait DownloadEventListener: Send + Sync {
     /// Called for every fired download event.
     fn on_download_event(&self, event: DownloadEvent, gid: &str);
+
+    /// Called for lifecycle events emitted by a request manager.
+    ///
+    /// The default keeps existing process-wide observers compatible. A
+    /// manager-scoped observer can override this method to distinguish equal
+    /// GIDs owned by different managers.
+    fn on_download_event_scoped(&self, event: DownloadEvent, gid: &str, _scope_id: u64) {
+        self.on_download_event(event, gid);
+    }
 
     /// Called after a metadata task has produced and queued its download
     /// groups.
@@ -315,8 +322,8 @@ const METADATA_HISTORY_CAPACITY: usize = 1024;
 /// Two-generation bounded de-duplication ledger for one-shot events.
 #[derive(Default)]
 struct OneShotLedger {
-    current: HashSet<(String, DownloadEvent)>,
-    previous: HashSet<(String, DownloadEvent)>,
+    current: HashSet<(Option<u64>, String, DownloadEvent)>,
+    previous: HashSet<(Option<u64>, String, DownloadEvent)>,
 }
 
 impl OneShotLedger {
@@ -324,7 +331,7 @@ impl OneShotLedger {
     ///
     /// Returns `true` when the caller should proceed with the notification,
     /// `false` when the event was already delivered.
-    fn claim(&mut self, key: (String, DownloadEvent)) -> bool {
+    fn claim(&mut self, key: (Option<u64>, String, DownloadEvent)) -> bool {
         if self.current.contains(&key) || self.previous.contains(&key) {
             return false;
         }
@@ -487,6 +494,15 @@ impl DownloadEventHooks {
     /// the `RequestGroup` state change and again at engine-loop demotion is
     /// only delivered once.
     pub fn notify_listeners(&self, event: DownloadEvent, gid: &str) {
+        self.notify_listeners_in_scope(event, gid, None);
+    }
+
+    /// Notify observers with the owning request manager's identity.
+    pub(crate) fn notify_listeners_scoped(&self, event: DownloadEvent, gid: &str, scope_id: u64) {
+        self.notify_listeners_in_scope(event, gid, Some(scope_id));
+    }
+
+    fn notify_listeners_in_scope(&self, event: DownloadEvent, gid: &str, scope_id: Option<u64>) {
         // Snapshot under a short read lock so a listener callback can never
         // deadlock against `add_listener`.
         let listeners: Vec<Arc<dyn DownloadEventListener>> = {
@@ -504,7 +520,10 @@ impl DownloadEventHooks {
         };
 
         if event.is_once_per_download()
-            && !self.one_shot.recover_mut().claim((gid.to_string(), event))
+            && !self
+                .one_shot
+                .recover_mut()
+                .claim((scope_id, gid.to_string(), event))
         {
             debug!(
                 event = event.name(),
@@ -525,7 +544,11 @@ impl DownloadEventHooks {
             "Notifying download event listeners"
         );
         for listener in listeners {
-            listener.on_download_event(event, gid);
+            if let Some(scope_id) = scope_id {
+                listener.on_download_event_scoped(event, gid, scope_id);
+            } else {
+                listener.on_download_event(event, gid);
+            }
         }
     }
 
@@ -637,7 +660,7 @@ impl DownloadEventHooks {
         // onBtDownloadComplete) are delivered through this path, and gating
         // them on an unrelated `--on-download-*` CLI option would leave every
         // default deployment without completion notifications.
-        self.notify_listeners(event, &gid_hex);
+        self.notify_listeners_scoped(event, &gid_hex, group.event_scope_id());
     }
 
     /// Fire a download event hook using direct parameters instead of a group.
@@ -655,12 +678,50 @@ impl DownloadEventHooks {
         first_file_path: &str,
         command: &str,
     ) {
+        self.fire_event_with_params_in_scope(
+            event,
+            gid_hex,
+            num_files,
+            first_file_path,
+            command,
+            None,
+        );
+    }
+
+    pub(crate) fn fire_event_with_params_scoped(
+        &self,
+        event: DownloadEvent,
+        gid_hex: &str,
+        num_files: usize,
+        first_file_path: &str,
+        command: &str,
+        scope_id: u64,
+    ) {
+        self.fire_event_with_params_in_scope(
+            event,
+            gid_hex,
+            num_files,
+            first_file_path,
+            command,
+            Some(scope_id),
+        );
+    }
+
+    fn fire_event_with_params_in_scope(
+        &self,
+        event: DownloadEvent,
+        gid_hex: &str,
+        num_files: usize,
+        first_file_path: &str,
+        command: &str,
+        scope_id: Option<u64>,
+    ) {
         // Sink 1 — only when a shell command was actually configured.
         if !command.is_empty() {
             self.spawn_hook(command, gid_hex, num_files, first_file_path, event);
         }
         // Sink 2 — always. See `fire_event` for why this must not be gated.
-        self.notify_listeners(event, gid_hex);
+        self.notify_listeners_in_scope(event, gid_hex, scope_id);
     }
 
     /// Extract `(numFiles, firstFilePath)` hook arguments from a group.
@@ -1155,6 +1216,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminal_stream_helper_waits_past_bt_payload_completion() {
+        let hooks = DownloadEventHooks::new();
+        let mut stream = hooks.subscribe();
+        let requested_gid = crate::request::request_group::GroupId::new(12);
+        let gid = requested_gid.to_hex_string();
+
+        hooks.notify_listeners(DownloadEvent::BtComplete, &gid);
+        hooks.notify_listeners(DownloadEvent::Complete, &gid);
+
+        assert_eq!(
+            stream
+                .recv_terminal_for(requested_gid)
+                .await
+                .expect("seeding completion is terminal"),
+            DownloadEvent::Complete
+        );
+    }
+
     /// Regression test for the P0 defect: observers were only reached when a
     /// `--on-download-*` shell command happened to be configured, so RPC
     /// clients never saw `aria2.onDownloadComplete` in a default deployment.
@@ -1255,7 +1335,7 @@ mod tests {
         assert!(DownloadEvent::Stop.is_terminal());
         assert!(DownloadEvent::Complete.is_terminal());
         assert!(DownloadEvent::Error.is_terminal());
-        assert!(DownloadEvent::BtComplete.is_terminal());
+        assert!(!DownloadEvent::BtComplete.is_terminal());
         assert!(!DownloadEvent::Start.is_terminal());
         assert!(!DownloadEvent::Pause.is_terminal());
     }
@@ -1264,13 +1344,14 @@ mod tests {
     fn test_one_shot_ledger_rotates_and_stays_bounded() {
         let mut ledger = OneShotLedger::default();
         for i in 0..(DEDUP_GENERATION_CAPACITY + 10) {
-            assert!(ledger.claim((format!("{:016x}", i), DownloadEvent::Complete)));
+            assert!(ledger.claim((None, format!("{:016x}", i), DownloadEvent::Complete)));
         }
         // Rotation happened, so neither generation exceeds the cap.
         assert!(ledger.current.len() <= DEDUP_GENERATION_CAPACITY);
         assert!(ledger.previous.len() <= DEDUP_GENERATION_CAPACITY);
         // The most recent entries are still remembered.
         assert!(!ledger.claim((
+            None,
             format!("{:016x}", DEDUP_GENERATION_CAPACITY + 9),
             DownloadEvent::Complete
         )));

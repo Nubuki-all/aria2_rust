@@ -4,14 +4,15 @@ use crate::constants;
 use crate::engine::concurrent_segment_manager::ConcurrentSegmentManager;
 use crate::error::{Aria2Error, Result};
 use crate::filesystem::control_file::ControlFile;
-use crate::filesystem::disk_writer::CachedDiskWriter;
-use crate::filesystem::resume_helper::ResumeState;
+use crate::filesystem::disk_writer::{CachedDiskWriter, SeekableDiskWriter};
+use crate::filesystem::resume_helper::{ResumeState, is_sequential_checkpoint};
 use crate::rate_limiter::{RateLimiter, RateLimiterConfig};
 use crate::request::request_group::DownloadOptions;
 use crate::util::rwlock_ext::RwLockRecover;
 
 use super::super::ConcurrentDownloader;
 use super::super::fixed_piece_size::calculate_fixed_piece_size;
+use super::super::in_flight::InFlightProgress;
 use super::super::{effective_segment_count, flush_requested_control_file};
 use crate::engine::mirror_coordinator::MirrorCoordinator;
 
@@ -23,6 +24,7 @@ pub(super) struct PreparedMultiMirrorDownload {
     pub(super) max_conn: usize,
     pub(super) session_limit: usize,
     pub(super) coordinator: MirrorCoordinator,
+    pub(super) in_flight_progress: InFlightProgress,
     pub(super) writer: CachedDiskWriter,
     pub(super) limiter: Option<RateLimiter>,
     pub(super) ctrl_path: PathBuf,
@@ -50,6 +52,7 @@ pub(super) async fn prepare(
         })
         .and_then(ControlFile::piece_length)
         .map(u64::from)
+        .filter(|&piece_size| piece_size > 0 && piece_size < total_length)
         .unwrap_or_else(|| calculate_fixed_piece_size(total_length));
     let piece_length = u32::try_from(fixed_piece_size).map_err(|_| {
         Aria2Error::InvalidArgument(format!(
@@ -120,6 +123,8 @@ pub(super) async fn prepare(
     }
 
     let num_pieces = coordinator.num_segments().max(1);
+    let mut in_flight_progress =
+        InFlightProgress::new(total_length, fixed_piece_size, coordinator.num_segments());
     tracing::info!(
         split_budget = split,
         requested_split,
@@ -132,16 +137,6 @@ pub(super) async fn prepare(
     let ctrl_path = ControlFile::control_path_for(&dl.output_path);
     dl.group.recover().set_control_file_path(ctrl_path.clone());
     let expected_bitfield_len = num_pieces.div_ceil(8);
-    let persisted_prefix = resume_state
-        .control_file
-        .as_ref()
-        .map(ControlFile::completed_length)
-        .filter(|&length| length > 0)
-        .or_else(|| {
-            (resume_state.control_file.is_none() && resume_state.should_resume)
-                .then_some(resume_state.start_offset)
-        })
-        .unwrap_or(0);
     let compatible_control_file = resume_state.control_file.as_ref().filter(|control_file| {
         control_file.total_length() == total_length
             && !control_file.is_torrent_checkpoint()
@@ -176,7 +171,11 @@ pub(super) async fn prepare(
     // sidecar left behind. If replacing that sidecar failed, the file and
     // its progress metadata cannot be reconciled, so restart the segments
     // instead of trusting ResumeState::start_offset.
-    let can_restore_prefix = resume_state.control_file.is_none()
+    let sequential_checkpoint = resume_state
+        .control_file
+        .as_ref()
+        .is_some_and(|control_file| is_sequential_checkpoint(control_file, total_length));
+    let can_restore_prefix = (resume_state.control_file.is_none() || sequential_checkpoint)
         && resume_state.should_resume
         && (!has_untrusted_control_file || can_initialize_new_control_file);
 
@@ -207,10 +206,16 @@ pub(super) async fn prepare(
     };
 
     let restored_bytes = if let Some(control_file) = ctrl_file.as_ref() {
-        let restored = if compatible_control_file.is_some() && control_file.completed_pieces() > 0 {
-            coordinator.restore_completed_from_bitfield(control_file.bitfield())
-        } else if compatible_control_file.is_some() || can_restore_prefix {
-            coordinator.restore_completed_prefix(persisted_prefix)
+        let restored = if compatible_control_file.is_some() {
+            coordinator.restore_completed_from_bitfield(control_file.bitfield());
+            for (index, prefix) in
+                in_flight_progress.restore(control_file.in_flight_pieces(), control_file.bitfield())
+            {
+                coordinator.restore_completed_segment_prefix(index, prefix);
+            }
+            coordinator.completed_bytes()
+        } else if can_restore_prefix {
+            coordinator.restore_completed_prefix(resume_state.start_offset)
         } else {
             0
         };
@@ -235,13 +240,46 @@ pub(super) async fn prepare(
     } else {
         0
     };
+    // Preserve restored full pieces and canonicalize in-flight records. The
+    // completed-length field is an aggregate for this layout, not a prefix.
+    if let Some(control_file) = ctrl_file.as_mut() {
+        for (offset, length) in coordinator.completed_ranges() {
+            if offset % fixed_piece_size == 0
+                && length == fixed_piece_size.min(total_length.saturating_sub(offset))
+                && let Ok(index) = usize::try_from(offset / fixed_piece_size)
+            {
+                control_file.mark_piece_done(index);
+            }
+        }
+        let in_flight_pieces = in_flight_progress.snapshot(control_file.bitfield());
+        control_file.set_in_flight_pieces(in_flight_pieces);
+    }
     dl.progress_updater.reset(restored_bytes);
     dl.progress.set_completed_length(restored_bytes);
 
     if let Some(control_file) = ctrl_file.as_mut() {
-        control_file.update_completed_length(restored_bytes);
-        if let Err(error) = control_file.save().await {
-            tracing::warn!(%error, "Failed to save initial multi-mirror control file");
+        let payload_ready = if restored_bytes > 0
+            && restored_bytes != control_file.completed_length()
+        {
+            match writer.sync_all().await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(
+                        restored_bytes,
+                        %error,
+                        "Not persisting an initial multi-mirror checkpoint for an unsynced resume prefix"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if payload_ready {
+            control_file.update_completed_length(restored_bytes);
+            if let Err(error) = control_file.save().await {
+                tracing::warn!(%error, "Failed to save initial multi-mirror control file");
+            }
         }
     }
     flush_requested_control_file(
@@ -249,6 +287,7 @@ pub(super) async fn prepare(
         &mut writer,
         &mut ctrl_file,
         coordinator.completed_bytes(),
+        Some(&in_flight_progress),
     )
     .await?;
     let ctrl_save_interval = (total_length / num_pieces as u64).max(1);
@@ -261,6 +300,7 @@ pub(super) async fn prepare(
         max_conn,
         session_limit,
         coordinator,
+        in_flight_progress,
         writer,
         limiter,
         ctrl_path,

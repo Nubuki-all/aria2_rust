@@ -96,6 +96,18 @@ fn dynamic_subranges_keep_parent_incomplete_until_all_bytes_succeed() {
 }
 
 #[test]
+fn scheduler_can_claim_the_specific_pending_parent_segment() {
+    let mut mgr = ConcurrentSegmentManager::new(200, vec!["http://x.com/f".to_string()], Some(100));
+
+    assert_eq!(
+        mgr.next_pending_range_for_segment(0, 1, 40),
+        Some((1, 100, 40))
+    );
+    assert_eq!(mgr.segment_status(0), Some(SegmentStatus::Pending));
+    assert_eq!(mgr.segment_status(1), Some(SegmentStatus::Downloading));
+}
+
+#[test]
 fn test_completed_ranges_exclude_partial_or_failed_segments() {
     let mut mgr = ConcurrentSegmentManager::new(300, vec!["http://x.com/f".to_string()], Some(100));
     mgr.allocate_segments();
@@ -138,6 +150,23 @@ fn test_restore_completed_prefix_tracks_partial_parent_offset() {
     assert_eq!(mgr.segment_status(1), Some(SegmentStatus::Done));
     assert_eq!(mgr.segment_status(2), Some(SegmentStatus::Pending));
     assert_eq!(mgr.next_pending_range_for_mirror(0, 50), Some((2, 250, 50)));
+}
+
+#[test]
+fn restoring_an_inflight_parent_prefix_resumes_at_its_first_missing_byte() {
+    let mut mgr = ConcurrentSegmentManager::new(
+        300,
+        vec!["http://x.com/f".to_string(), "http://y.com/f".to_string()],
+        Some(100),
+    );
+
+    assert_eq!(mgr.restore_completed_segment_prefix(1, 24), Some(24));
+    assert_eq!(mgr.completed_bytes(), 24);
+    assert_eq!(mgr.segment_status(1), Some(SegmentStatus::Pending));
+    assert_eq!(
+        mgr.next_pending_range_for_segment(1, 1, 50),
+        Some((1, 124, 50))
+    );
 }
 
 #[test]

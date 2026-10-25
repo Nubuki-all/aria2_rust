@@ -1,7 +1,9 @@
 mod choke_api;
 mod constructor;
 mod integration_api;
+mod torrent_context;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +16,8 @@ use crate::request::request_group::{AtomicProgress, RequestGroup};
 use crate::util::rwlock_ext::RwLockRecover;
 
 // Re-export sub-module public items
-pub use constructor::prepare_group_metadata;
-pub(crate) use constructor::{
+pub use torrent_context::prepare_group_metadata;
+pub(crate) use torrent_context::{
     apply_file_mappings, apply_select_file_filter, build_download_context_from_meta,
 };
 pub(crate) const MAX_PUBLIC_TRACKERS_TO_TRY: usize = 10;
@@ -240,9 +242,9 @@ pub struct BtDownloadCommand {
     /// Receiver for incoming peers routed by the engine-owned listener.
     pub(crate) incoming_peers:
         Option<crate::engine::bittorrent::peer::listener::IncomingPeerReceiver>,
-    /// Shared uTP socket for outbound peers in this download task.
-    pub(crate) utp_socket:
-        Option<Arc<tokio::sync::Mutex<aria2_protocol::bittorrent::utp::UtpSocket>>>,
+    /// Handle to the process-owned uTP socket actor registered for this torrent.
+    pub(crate) utp_transport:
+        Option<crate::engine::bittorrent::peer::utp_transport::UtpTransportHandle>,
     /// Process-level listener shared by all BitTorrent downloads.
     pub(crate) bt_listener:
         Option<Arc<crate::engine::bittorrent::peer::listener::BtPeerListenerManager>>,
@@ -254,6 +256,8 @@ pub struct BtDownloadCommand {
     pub(crate) checkpoint_bytes_since_save: u64,
     /// Time at which the last durable torrent checkpoint completed.
     pub(crate) checkpoint_last_save: Instant,
+    /// Multi-file payloads modified since the last durable checkpoint.
+    pub(crate) dirty_multi_file_indices: HashSet<usize>,
 }
 
 impl BtDownloadCommand {

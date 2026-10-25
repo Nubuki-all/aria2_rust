@@ -1,7 +1,9 @@
 //! Concurrent download module — split into sub-modules for maintainability.
 
 mod fixed_piece_size;
+mod in_flight;
 mod pipeline;
+mod range_commit;
 mod range_size_limit;
 mod segment;
 mod slow_range;
@@ -21,6 +23,8 @@ use crate::http::HttpRequestPolicy;
 use crate::rate_limiter::RateLimiter;
 use crate::request::request_group::{AtomicProgress, RequestGroup};
 use crate::util::rwlock_ext::RwLockRecover;
+
+use self::in_flight::InFlightProgress;
 
 /// Cap the requested concurrent ranges at aria2's minimum split-size policy.
 ///
@@ -162,22 +166,27 @@ pub struct ConcurrentDownloader {
     pub(crate) initial_http_protocol: Option<(String, reqwest::Version)>,
 }
 
-pub(super) async fn flush_requested_control_file(
+pub(in crate::engine::http::concurrent_download) async fn flush_requested_control_file(
     dl: &ConcurrentDownloader,
     writer: &mut CachedDiskWriter,
     control_file: &mut Option<ControlFile>,
     completed_bytes: u64,
+    in_flight_progress: Option<&InFlightProgress>,
 ) -> Result<()> {
     if control_file.is_none() || !dl.group.recover().is_save_control_file_requested() {
         return Ok(());
     }
 
-    writer.flush().await.map_err(|error| {
+    writer.sync_all().await.map_err(|error| {
         Aria2Error::FileIo(format!(
-            "Failed to flush requested concurrent checkpoint: {error}"
+            "Failed to durably sync requested concurrent checkpoint payload: {error}"
         ))
     })?;
     if let Some(control_file) = control_file.as_mut() {
+        if let Some(progress) = in_flight_progress {
+            let pieces = progress.snapshot(control_file.bitfield());
+            control_file.set_in_flight_pieces(pieces);
+        }
         control_file.update_completed_length(completed_bytes);
         control_file.save().await.map_err(|error| {
             Aria2Error::FileIo(format!(

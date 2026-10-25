@@ -109,6 +109,33 @@ fn status_snapshot_uses_one_bt_peer_source_for_all_consumers() {
 }
 
 #[test]
+fn terminal_status_snapshots_report_zero_transfer_speeds() {
+    for (index, terminal_state) in ["complete", "error", "removed"].into_iter().enumerate() {
+        let mut group = RequestGroup::new(
+            GroupId::new(300 + index as u64),
+            Vec::new(),
+            DownloadOptions::default(),
+        );
+
+        match terminal_state {
+            "complete" => group.complete().expect("complete download"),
+            "error" => group.error("download failed").expect("failed download"),
+            "removed" => group.mark_removed(),
+            _ => unreachable!("test state is terminal"),
+        }
+
+        // A last progress update can race with a terminal transition.
+        group.set_download_speed_cached(512);
+        group.set_upload_speed_cached(256);
+
+        let snapshot = group.status_snapshot();
+        assert!(snapshot.status.is_terminal(), "state: {terminal_state}");
+        assert_eq!(snapshot.download_speed, 0, "state: {terminal_state}");
+        assert_eq!(snapshot.upload_speed, 0, "state: {terminal_state}");
+    }
+}
+
+#[test]
 fn active_connection_guard_clears_protocol_count_on_exit() {
     let group = std::sync::Arc::new(std::sync::RwLock::new(RequestGroup::new(
         GroupId::new(101),

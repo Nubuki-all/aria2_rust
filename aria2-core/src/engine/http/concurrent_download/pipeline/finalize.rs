@@ -8,6 +8,7 @@ use crate::filesystem::disk_writer::{CachedDiskWriter, SeekableDiskWriter};
 use crate::rate_limiter::RateLimiter;
 use crate::util::rwlock_ext::RwLockRecover;
 
+use super::super::in_flight::InFlightProgress;
 use super::super::{ConcurrentDownloadResult, ConcurrentDownloader};
 use crate::engine::mirror_coordinator::MirrorCoordinator;
 
@@ -23,35 +24,43 @@ pub(super) async fn finish(
     ctrl_file: &mut Option<ControlFile>,
     ctrl_path: &Path,
     progress_tracker: &SegmentProgressTracker,
+    in_flight_progress: &mut InFlightProgress,
 ) -> Result<ConcurrentDownloadResult> {
     if should_fallback {
         super::super::segment::cancel_and_persist(
+            dl,
             executor,
             write_rx,
             writer,
             limiter,
-            dl.global_limiter.as_ref(),
             ctrl_file,
             coordinator.completed_bytes(),
+            Some(in_flight_progress),
         )
         .await?;
     } else {
         executor.shutdown().await;
     }
     while let Ok(WriteChunk { offset, data }) = write_rx.try_recv() {
-        super::super::acquire_download_tokens(limiter, dl.global_limiter.as_ref(), data.len())
-            .await;
-        writer.write_bytes_at(offset, data).await.map_err(|e| {
-            Aria2Error::Fatal(crate::error::FatalError::Config(format!(
-                "Write failed: {}",
-                e
-            )))
-        })?;
+        super::super::range_commit::write_http_range_chunk(
+            dl,
+            writer,
+            limiter,
+            ctrl_file,
+            super::super::range_commit::HttpRangeCommitOptions {
+                completed_bytes: coordinator.completed_bytes(),
+                flush_checkpoint: false,
+                error_context: "",
+                in_flight: Some(in_flight_progress),
+            },
+            WriteChunk { offset, data },
+        )
+        .await?;
     }
 
-    writer.flush().await.map_err(|e| {
+    writer.sync_all().await.map_err(|e| {
         Aria2Error::Fatal(crate::error::FatalError::Config(format!(
-            "Flush failed: {}",
+            "Durable output sync failed: {}",
             e
         )))
     })?;
@@ -65,21 +74,19 @@ pub(super) async fn finish(
         return Ok(ConcurrentDownloadResult::Fallback { completed_ranges });
     }
 
+    let completed_bytes = coordinator.completed_bytes();
     let final_speed = {
         let g = dl.group.recover();
         let elapsed = g.elapsed_time();
         match elapsed {
-            Some(d) if d.as_secs_f64() > 0.0 => {
-                (dl.progress_updater.last_progress_update() as f64 / d.as_secs_f64()) as u64
-            }
+            Some(d) if d.as_secs_f64() > 0.0 => (completed_bytes as f64 / d.as_secs_f64()) as u64,
             _ => 0,
         }
     };
 
     {
-        let last = dl.progress_updater.last_progress_update();
-        dl.progress.set_total_length(last);
-        dl.progress.set_completed_length(last);
+        dl.progress.set_total_length(completed_bytes);
+        dl.progress.set_completed_length(completed_bytes);
         dl.progress.set_download_speed(final_speed);
         dl.progress.set_upload_speed(0);
         let mut g = dl.group.recover_mut();
@@ -89,7 +96,7 @@ pub(super) async fn finish(
     tracing::info!(
         "Multi-mirror concurrent download complete: {} ({} bytes, {} B/s)",
         dl.output_path.display(),
-        dl.progress_updater.last_progress_update(),
+        completed_bytes,
         final_speed
     );
     let progress_stats = progress_tracker.stats();
@@ -100,6 +107,8 @@ pub(super) async fn finish(
         "HTTP multi-mirror progress aggregation summary"
     );
     if let Some(control_file) = ctrl_file.as_mut() {
+        let in_flight_pieces = in_flight_progress.snapshot(control_file.bitfield());
+        control_file.set_in_flight_pieces(in_flight_pieces);
         control_file.update_completed_length(coordinator.completed_bytes());
         if let Err(error) = control_file.save().await {
             tracing::warn!(%error, "Failed to save final multi-mirror control file");

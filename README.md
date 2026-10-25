@@ -112,8 +112,12 @@ irm https://raw.githubusercontent.com/balovess/aria2_rust/main/install.ps1 | iex
 
 **Docker (Linux amd64 image):**
 ```bash
-docker run -d --name aria2 -p 6800:6800 -v ~/downloads:/downloads ghcr.io/balovess/aria2-rust:latest
+docker run -d --name aria2 -p 127.0.0.1:6800:6800 -v ~/downloads:/downloads ghcr.io/balovess/aria2-rust:latest
 ```
+
+The RPC endpoint is unauthenticated unless `rpc-secret` is configured. This
+example publishes it only on the host's loopback interface; configure
+authentication and firewall rules before publishing it on other interfaces.
 
 **Package Managers:**
 
@@ -180,7 +184,7 @@ cookies, DHT state, and server statistics are enabled only by explicit options.
 <summary>Click to expand build instructions</summary>
 
 **Prerequisites:**
-- [Rust](https://www.rust-lang.org/tools/install) 1.70+ (stable)
+- [Rust](https://www.rust-lang.org/tools/install) 1.99+ (stable)
 - Windows / macOS / Linux
 
 **Build Commands:**
@@ -525,7 +529,7 @@ async fn main() {
 
 ### Requirements
 
-- **Rust**: 1.70 or later ([install](https://rustup.rs/))
+- **Rust**: 1.99 or later ([install](https://rustup.rs/))
 - **OS**: Windows 10+, macOS 10.15+, Linux (glibc 2.17+)
 
 ### Build Commands

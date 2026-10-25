@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use crate::engine::concurrent_segment_manager::ConcurrentSegmentManager;
+use crate::engine::concurrent_segment_manager::{ConcurrentSegmentManager, SegmentStatus};
 use crate::error::Result;
 use crate::filesystem::control_file::ControlFile;
-use crate::filesystem::disk_writer::CachedDiskWriter;
-use crate::filesystem::resume_helper::ResumeState;
+use crate::filesystem::disk_writer::{CachedDiskWriter, SeekableDiskWriter};
+use crate::filesystem::resume_helper::{ResumeState, is_sequential_checkpoint};
 use crate::util::rwlock_ext::RwLockRecover;
 
 use super::super::{ConcurrentDownloader, flush_requested_control_file};
@@ -55,7 +55,11 @@ pub(super) async fn prepare(
     } else {
         true
     };
-    let can_restore_prefix = resume_state.control_file.is_none()
+    let sequential_checkpoint = resume_state
+        .control_file
+        .as_ref()
+        .is_some_and(|control_file| is_sequential_checkpoint(control_file, total_length));
+    let can_restore_prefix = (resume_state.control_file.is_none() || sequential_checkpoint)
         && resume_state.should_resume
         && (!has_untrusted_control_file || can_initialize_control_file);
     let mut ctrl_file = if let Some(control_file) = compatible_control_file {
@@ -101,6 +105,15 @@ pub(super) async fn prepare(
     } else {
         0
     };
+    // Prefix-restored segments must be represented in the replacement
+    // bitfield too; otherwise the following resume loses the same progress.
+    if let Some(control_file) = ctrl_file.as_mut() {
+        for index in 0..manager.num_segments() {
+            if manager.segment_status(index) == Some(SegmentStatus::Done) {
+                control_file.mark_piece_done(index);
+            }
+        }
+    }
     dl.progress_updater.reset(completed_bytes);
     dl.progress.set_completed_length(completed_bytes);
     if resume_state.should_resume {
@@ -113,13 +126,31 @@ pub(super) async fn prepare(
     }
 
     if let Some(control_file) = ctrl_file.as_mut() {
-        control_file.update_completed_length(completed_bytes);
-        if let Err(error) = control_file.save().await {
-            tracing::warn!("Failed to save initial control file: {}", error);
+        let payload_ready =
+            if completed_bytes > 0 && completed_bytes != control_file.completed_length() {
+                match writer.sync_all().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::debug!(
+                            completed_bytes,
+                            %error,
+                            "Not persisting an initial checkpoint for an unsynced resume prefix"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+        if payload_ready {
+            control_file.update_completed_length(completed_bytes);
+            if let Err(error) = control_file.save().await {
+                tracing::warn!("Failed to save initial control file: {}", error);
+            }
         }
     }
     let ctrl_save_interval = total_length / num_pieces as u64;
-    flush_requested_control_file(dl, writer, &mut ctrl_file, completed_bytes).await?;
+    flush_requested_control_file(dl, writer, &mut ctrl_file, completed_bytes, None).await?;
 
     Ok(PreparedResume {
         ctrl_path,

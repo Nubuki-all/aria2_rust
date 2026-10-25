@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "aria2"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "aria2-core",
  "aria2-protocol",
@@ -211,11 +211,12 @@ dependencies = [
  "tokio-tungstenite 0.21.0",
  "toml",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "aria2-core"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "adler32",
  "aes-gcm 0.10.3",
@@ -260,6 +261,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
@@ -280,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "aria2-protocol"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "async-trait",

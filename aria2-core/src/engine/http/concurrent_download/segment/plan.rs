@@ -41,6 +41,10 @@ pub(super) fn create(
         })
         .and_then(ControlFile::piece_length)
         .map(u64::from)
+        // A sequential checkpoint has one piece spanning the whole file.
+        // Reusing it would turn the remaining download into a single range,
+        // so later pauses could not persist any new completed pieces.
+        .filter(|&piece_size| piece_size > 0 && piece_size < total_length)
         .unwrap_or_else(|| calculate_fixed_piece_size(total_length));
     let piece_length = u32::try_from(piece_size).map_err(|_| {
         Aria2Error::InvalidArgument(format!(

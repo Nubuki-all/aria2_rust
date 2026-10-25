@@ -12,7 +12,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::util::rwlock_ext::RwLockRecover;
 
 use super::super::{ConcurrentDownloadResult, ConcurrentDownloader};
-use super::io::drain_write_chunks;
+use super::io::{DrainWriteChunksOptions, drain_write_chunks};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish(
@@ -33,10 +33,22 @@ pub(super) async fn finish(
     } else {
         executor.shutdown().await;
     }
-    drain_write_chunks(write_rx, writer, limiter, dl.global_limiter.as_ref(), "").await?;
-    writer.flush().await.map_err(|error| {
+    drain_write_chunks(
+        dl,
+        write_rx,
+        writer,
+        limiter,
+        ctrl_file,
+        DrainWriteChunksOptions {
+            completed_bytes,
+            in_flight: None,
+            error_context: "",
+        },
+    )
+    .await?;
+    writer.sync_all().await.map_err(|error| {
         Aria2Error::Fatal(crate::error::FatalError::Config(format!(
-            "Flush failed: {error}"
+            "Durable output sync failed: {error}"
         )))
     })?;
 

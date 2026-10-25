@@ -11,6 +11,48 @@ use crate::util::rwlock_ext::RwLockRecover;
 use super::SequentialDownloader;
 use super::download_flow::finalize_cancelled_download;
 
+struct HttpResponseBodySink<'a> {
+    downloader: &'a SequentialDownloader,
+    writer: &'a mut Box<dyn DiskWriter>,
+    control_file: &'a mut Option<ControlFile>,
+    completed_bytes: &'a mut u64,
+    bytes_since_save: &'a mut u64,
+    save_interval: u64,
+}
+
+impl HttpResponseBodySink<'_> {
+    async fn write_chunk(&mut self, output: &bytes::Bytes) -> Result<()> {
+        self.writer.write(output).await?;
+        let written_bytes = output.len() as u64;
+        *self.completed_bytes = self.completed_bytes.saturating_add(written_bytes);
+        *self.bytes_since_save = self.bytes_since_save.saturating_add(written_bytes);
+        let save_requested = self
+            .downloader
+            .flush_requested_control_file(self.writer, self.control_file, *self.completed_bytes)
+            .await?;
+        if save_requested {
+            *self.bytes_since_save = 0;
+        } else if let Some(control_file) = self.control_file.as_mut()
+            && *self.bytes_since_save >= self.save_interval
+        {
+            // The control file must never claim a prefix that exists only in
+            // the page cache. This is a periodic durability barrier, not a
+            // per-network-chunk sync.
+            self.writer.sync_data().await.map_err(|error| {
+                Aria2Error::FileIo(format!(
+                    "Failed to durably sync sequential HTTP checkpoint payload: {error}"
+                ))
+            })?;
+            control_file.update_completed_length(*self.completed_bytes);
+            if let Err(error) = control_file.save().await {
+                tracing::warn!("Sequential: control file save failed: {}", error);
+            }
+            *self.bytes_since_save = 0;
+        }
+        Ok(())
+    }
+}
+
 impl SequentialDownloader {
     /// Download the response body to the output file.
     ///
@@ -102,11 +144,34 @@ impl SequentialDownloader {
         let mut ctrl_file = if actual_total > 0 {
             match ControlFile::open_or_create(&ctrl_path, actual_total, 1).await {
                 Ok(mut cf) => {
-                    if start_offset > 0 {
-                        cf.update_completed_length(start_offset);
-                    }
-                    if let Err(e) = cf.save().await {
-                        tracing::warn!("Sequential: control file save failed: {}", e);
+                    let checkpoint_length = start_offset.min(cf.total_length());
+                    let payload_ready = if checkpoint_length > 0
+                        && checkpoint_length != cf.completed_length()
+                    {
+                        match crate::filesystem::durability::sync_existing_payload(
+                            &self.output_path,
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::debug!(
+                                    path = %self.output_path.display(),
+                                    checkpoint_length,
+                                    %error,
+                                    "Not persisting an initial checkpoint for an unsynced resume prefix"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if payload_ready {
+                        cf.update_completed_length(checkpoint_length);
+                        if let Err(error) = cf.save().await {
+                            tracing::warn!("Sequential: control file save failed: {}", error);
+                        }
                     }
                     Some(cf)
                 }
@@ -131,6 +196,15 @@ impl SequentialDownloader {
                 let lifecycle_changed = lifecycle_notifier.notified();
                 tokio::pin!(lifecycle_changed);
                 lifecycle_changed.as_mut().enable();
+                // The state transition can race with entering this wait, and
+                // `notify_waiters` does not retain a permit for a future
+                // waiter. Recheck after registering so a pause/remove that
+                // happened just before `enable()` cannot strand the command
+                // in `stream.next()` until the peer sends another chunk.
+                if let Err(error) = self.check_cancelled() {
+                    finalize_cancelled_download(&mut writer, &mut ctrl_file, completed_bytes).await;
+                    return Err(error);
+                }
                 tokio::select! {
                     chunk = stream.next() => chunk,
                     _ = &mut lifecycle_changed => {
@@ -176,25 +250,19 @@ impl SequentialDownloader {
             let mut offset = 0usize;
             while offset < data.len() {
                 let end = (offset + write_piece).min(data.len());
-                let piece = &data[offset..end];
-                writer.write(piece).await?;
-                completed_bytes += piece.len() as u64;
-                offset = end;
-
-                // ADR-0001: Periodically update control file with progress.
-                ctrl_bytes_since_save += piece.len() as u64;
-                let save_requested = self
-                    .flush_requested_control_file(&mut writer, &mut ctrl_file, completed_bytes)
-                    .await?;
-                if let Some(cf) = ctrl_file.as_mut()
-                    && (save_requested || ctrl_bytes_since_save >= ctrl_save_interval)
+                let piece = data.slice(offset..end);
                 {
-                    cf.update_completed_length(completed_bytes);
-                    if let Err(e) = cf.save().await {
-                        tracing::warn!("Sequential: control file save failed: {}", e);
-                    }
-                    ctrl_bytes_since_save = 0;
+                    let mut sink = HttpResponseBodySink {
+                        downloader: self,
+                        writer: &mut writer,
+                        control_file: &mut ctrl_file,
+                        completed_bytes: &mut completed_bytes,
+                        bytes_since_save: &mut ctrl_bytes_since_save,
+                        save_interval: ctrl_save_interval,
+                    };
+                    sink.write_chunk(&piece).await?;
                 }
+                offset = end;
 
                 self.progress_updater
                     .update_progress(
